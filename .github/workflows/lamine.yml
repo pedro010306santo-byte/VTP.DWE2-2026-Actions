@@ -1,0 +1,291 @@
+name: Push-to-EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: "Install or update EC2 packages before deploying"
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: ec2-deploy-main
+  cancel-in-progress: true
+
+env:
+  EC2_HOST: 3.232.78.47
+  EC2_USER: ${{ secrets.EC2_USER || 'ubuntu' }}
+  APP_DIR: /var/www/html/hdcevents
+  APP_URL: http://3.232.78.47
+  DB_DATABASE: ${{ secrets.DB_DATABASE || 'hdcevents' }}
+  DB_USERNAME: ${{ secrets.DB_USERNAME || 'laraveluser' }}
+  DB_PASSWORD: ${{ secrets.DB_PASSWORD || 'laravelpass123' }}
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          set -Eeuo pipefail
+
+          if [ -z "$EC2_SSH_KEY" ]; then
+            echo "::error::Missing EC2_SSH_KEY repository secret."
+            exit 1
+          fi
+
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+
+      - name: Check SSH port
+        run: |
+          set -Eeuo pipefail
+
+          if ! timeout 20s bash -c "echo >/dev/tcp/$EC2_HOST/22"; then
+            echo "::error::Cannot reach $EC2_HOST:22. Check that the EC2 instance is running, the public IP is correct, and the security group allows inbound TCP 22 from GitHub-hosted runners."
+            exit 1
+          fi
+
+      - name: Test SSH connection
+        run: |
+          set -Eeuo pipefail
+
+          SSH_OPTS="-i ~/.ssh/ec2_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2"
+
+          timeout 45s ssh $SSH_OPTS "$EC2_USER@$EC2_HOST" \
+            'echo "SSH ok"; hostname; date'
+
+      - name: Detect EC2 dependencies
+        id: dependencies
+        run: |
+          set -Eeuo pipefail
+
+          SSH_OPTS="-i ~/.ssh/ec2_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2"
+
+          if timeout 60s ssh $SSH_OPTS "$EC2_USER@$EC2_HOST" 'bash -s' <<'REMOTE'
+          set -Eeuo pipefail
+
+          missing=0
+          for cmd in apache2 mysql php composer tar; do
+            if ! command -v "$cmd" >/dev/null 2>&1; then
+              echo "$cmd is missing"
+              missing=1
+            fi
+          done
+
+          exit "$missing"
+          REMOTE
+          then
+            echo "needs_bootstrap=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_bootstrap=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bootstrap EC2 packages
+        if: ${{ steps.dependencies.outputs.needs_bootstrap == 'true' || (github.event_name == 'workflow_dispatch' && inputs.bootstrap) }}
+        run: |
+          set -Eeuo pipefail
+
+          SSH_OPTS="-i ~/.ssh/ec2_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2"
+
+          timeout 30m ssh $SSH_OPTS "$EC2_USER@$EC2_HOST" 'bash -s' <<'REMOTE'
+          set -Eeuxo pipefail
+
+          while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+            sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+            echo "Waiting for apt locks..."
+            sleep 10
+          done
+
+          sudo timeout 10m apt-get -o Acquire::Retries=3 update
+          sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a timeout 25m apt-get install -y \
+            -o Dpkg::Options::=--force-confdef \
+            -o Dpkg::Options::=--force-confold \
+            apache2 mysql-server composer unzip zip git curl tar \
+            php php-cli php-common libapache2-mod-php \
+            php-mysql php-xml php-curl php-zip php-bcmath php-mbstring php-gd php-intl
+
+          sudo systemctl enable --now apache2
+          sudo systemctl enable --now mysql
+          sudo a2enmod rewrite
+          REMOTE
+
+      - name: Check EC2 dependencies after bootstrap
+        run: |
+          set -Eeuo pipefail
+
+          SSH_OPTS="-i ~/.ssh/ec2_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2"
+
+          timeout 60s ssh $SSH_OPTS "$EC2_USER@$EC2_HOST" 'bash -s' <<'REMOTE'
+          set -Eeuo pipefail
+
+          missing=0
+          for cmd in apache2 mysql php composer tar; do
+            if ! command -v "$cmd" >/dev/null 2>&1; then
+              echo "::error::$cmd is not installed on the EC2 instance."
+              missing=1
+            fi
+          done
+
+          if [ "$missing" -ne 0 ]; then
+            echo "Bootstrap did not install all required dependencies."
+            exit 1
+          fi
+
+          php -v | head -n 1
+          composer --version
+          REMOTE
+
+      - name: Upload application
+        run: |
+          set -Eeuo pipefail
+
+          SSH_OPTS="-i ~/.ssh/ec2_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2"
+          remote_script='set -Eeuo pipefail
+          APP_DIR="/var/www/html/hdcevents"
+
+          case "$APP_DIR" in
+            /var/www/html/hdcevents) ;;
+            *) echo "Unexpected APP_DIR: $APP_DIR"; exit 1 ;;
+          esac
+
+          sudo mkdir -p "$APP_DIR"
+          sudo chown -R "$USER:www-data" "$APP_DIR"
+          cd "$APP_DIR"
+
+          find . -mindepth 1 -maxdepth 1 \
+            ! -name ".env" \
+            ! -name "vendor" \
+            ! -name "storage" \
+            -exec rm -rf {} +
+
+          tar -xzf -'
+
+          tar \
+            --exclude='./.git' \
+            --exclude='./.github' \
+            --exclude='./.env' \
+            --exclude='./vendor' \
+            --exclude='./node_modules' \
+            --exclude='./storage/logs/*' \
+            --exclude='./storage/framework/cache/*' \
+            --exclude='./storage/framework/sessions/*' \
+            --exclude='./storage/framework/views/*' \
+            -czf - . \
+            | timeout 180s ssh $SSH_OPTS "$EC2_USER@$EC2_HOST" "bash -c $(printf '%q' "$remote_script")"
+
+      - name: Configure Laravel and Apache
+        run: |
+          set -Eeuo pipefail
+
+          SSH_OPTS="-i ~/.ssh/ec2_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2"
+          remote_env=$(printf 'APP_DIR=%q APP_URL=%q EC2_HOST=%q DB_DATABASE=%q DB_USERNAME=%q DB_PASSWORD=%q' \
+            "$APP_DIR" "$APP_URL" "$EC2_HOST" "$DB_DATABASE" "$DB_USERNAME" "$DB_PASSWORD")
+
+          timeout 10m ssh $SSH_OPTS "$EC2_USER@$EC2_HOST" "$remote_env bash -s" <<'REMOTE'
+          set -Eeuo pipefail
+
+          cd "$APP_DIR"
+
+          if [ ! -f .env ]; then
+            cp .env.example .env
+          fi
+
+          set_env() {
+            key="$1"
+            value="$2"
+            tmp="$(mktemp)"
+
+            awk -v key="$key" -v value="$value" '
+              BEGIN { found = 0 }
+              $0 ~ "^" key "=" {
+                print key "=" value
+                found = 1
+                next
+              }
+              { print }
+              END {
+                if (! found) {
+                  print key "=" value
+                }
+              }
+            ' .env > "$tmp"
+
+            mv "$tmp" .env
+          }
+
+          set_env APP_NAME "HDC_Events"
+          set_env APP_ENV "production"
+          set_env APP_DEBUG "false"
+          set_env APP_URL "$APP_URL"
+          set_env DB_CONNECTION "mysql"
+          set_env DB_HOST "127.0.0.1"
+          set_env DB_PORT "3306"
+          set_env DB_DATABASE "$DB_DATABASE"
+          set_env DB_USERNAME "$DB_USERNAME"
+          set_env DB_PASSWORD "$DB_PASSWORD"
+
+          sudo mysql <<SQL
+          CREATE DATABASE IF NOT EXISTS \`${DB_DATABASE}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+          CREATE USER IF NOT EXISTS '${DB_USERNAME}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';
+          ALTER USER '${DB_USERNAME}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';
+          GRANT ALL PRIVILEGES ON \`${DB_DATABASE}\`.* TO '${DB_USERNAME}'@'localhost';
+          FLUSH PRIVILEGES;
+          SQL
+
+          COMPOSER_ALLOW_SUPERUSER=1 timeout 10m composer install \
+            --no-dev \
+            --prefer-dist \
+            --optimize-autoloader \
+            --no-interaction \
+            --no-progress
+
+          if ! grep -q '^APP_KEY=base64:' .env; then
+            php artisan key:generate --force
+          fi
+
+          php artisan optimize:clear
+          php artisan migrate --force
+
+          sudo chown -R "$USER:www-data" "$APP_DIR"
+          sudo chmod -R 775 storage bootstrap/cache
+
+          sudo tee /etc/apache2/sites-available/hdcevents.conf >/dev/null <<APACHE
+          <VirtualHost *:80>
+              ServerName ${EC2_HOST}
+              DocumentRoot ${APP_DIR}/public
+
+              <Directory ${APP_DIR}/public>
+                  AllowOverride All
+                  Require all granted
+              </Directory>
+
+              ErrorLog \${APACHE_LOG_DIR}/hdcevents-error.log
+              CustomLog \${APACHE_LOG_DIR}/hdcevents-access.log combined
+          </VirtualHost>
+          APACHE
+
+          sudo a2dissite 000-default.conf || true
+          sudo a2ensite hdcevents.conf
+          sudo systemctl reload apache2
+          REMOTE
+
+      - name: Verify HTTP response
+        run: |
+          set -Eeuo pipefail
+
+          curl --fail --show-error --silent --max-time 20 "$APP_URL" >/dev/null
+          echo "Application responded at $APP_URL"
