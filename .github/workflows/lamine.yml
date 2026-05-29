@@ -17,10 +17,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  EC2_HOST: 44.204.206.88
+  EC2_HOST: 3.95.23.23
   EC2_USER: ${{ secrets.EC2_USER || 'ubuntu' }}
   APP_DIR: /var/www/html/hdcevents
-  APP_URL: http://44.204.206.88
+  APP_URL: http://3.95.23.23
   DB_DATABASE: ${{ secrets.DB_DATABASE || 'hdcevents' }}
   DB_USERNAME: ${{ secrets.DB_USERNAME || 'laraveluser' }}
   DB_PASSWORD: ${{ secrets.DB_PASSWORD || 'laravelpass123' }}
