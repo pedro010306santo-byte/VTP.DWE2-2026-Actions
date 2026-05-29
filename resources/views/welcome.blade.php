@@ -15,7 +15,7 @@
 
 <img class="banner" src="{{ $base }}/img/banner.svg" alt="Banner HDC Events">
 
-<p>Oii aaaeder</p>
+<p>FUNCIONANDO DEMAIS</p>
 
 
 @endsection
